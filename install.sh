@@ -42,4 +42,4 @@ shell=$(basename "${SHELL:-sh}")
 if [ "$shell" != fish ] && (exec </dev/tty) 2>/dev/null; then "$dir/psst" --setup "$shell" </dev/tty || true; fi
 
 case ":$PATH:" in *":$dir:"*) ;; *) say "$dir is not on PATH: until a new terminal loads the integration, run it as $dir/psst" ;; esac
-say "next: psst --key  (saves your free OpenRouter key from https://openrouter.ai/keys; psst also asks for it on first use)"
+say "next: psst --key  (saves your free OpenRouter key from https://openrouter.ai/keys; PSST_PROVIDER=glm psst --key saves a GLM/z.ai key; psst also asks on first use)"

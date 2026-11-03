@@ -33,6 +33,14 @@ psst --key          # paste the key; the input is hidden and stays out of your s
 
 psst checks the key with OpenRouter and saves it to `~/.config/psst/key` (`%APPDATA%\psst\key` on Windows), readable only by you. If no key is saved, psst asks for one the first time you run it. `OPENROUTER_API_KEY`, if set, overrides the saved key; that's handy in CI.
 
+**GLM (z.ai).** psst can also use [GLM](https://z.ai) models with a z.ai API key:
+
+```sh
+PSST_PROVIDER=glm psst --key    # paste the key; it is saved to ~/.config/psst/glm_key, apart from the OpenRouter one
+```
+
+GLM is picked automatically when `GLM_API_KEY` (or `ZAI_API_KEY` / `ZHIPUAI_API_KEY`) is set and no OpenRouter key is. The model chain is `glm-4.6` → `glm-4.5-air` → `glm-4.5-flash`; `PSST_MODEL` overrides it. `PSST_GLM_API` points psst at another GLM endpoint, e.g. the Coding Plan (`https://api.z.ai/api/coding/paas/v4`) or bigmodel.cn (`https://open.bigmodel.cn/api/paas/v4`).
+
 **Shell integration.** psst works right away in a simplified mode. The first time, it asks once whether to add itself to your shell. If you say yes, it writes a block between `# >>> psst >>>` and `# <<< psst <<<` to `~/.zshrc`, `~/.bashrc` (`~/.bash_profile` on macOS) or your PowerShell profile. It never writes a second copy of the block. fish needs no config edits: psst loads from `vendor_conf.d`. With the integration, the command goes straight into your input line, and psst also sees your aliases, functions and last command.
 
 ```sh
@@ -42,7 +50,7 @@ psst --uninstall    # remove it, along with the saved key and the cache
 
 ## Privacy
 
-Requests go to free [OpenRouter](https://openrouter.ai) models with `data_collection: deny`. Some free-model providers may still log requests.
+Requests go to free [OpenRouter](https://openrouter.ai) models with `data_collection: deny`; some free-model providers may still log requests. With GLM, requests go to z.ai directly.
 
 A request contains:
 
@@ -59,8 +67,11 @@ It never contains file contents, other environment variables, the rest of your h
 
 | Variable | Meaning |
 | --- | --- |
-| `OPENROUTER_API_KEY` | overrides the key saved by `psst --key` |
-| `PSST_MODEL` | model id, default `cohere/north-mini-code:free` with two free fallbacks |
+| `OPENROUTER_API_KEY` | overrides the OpenRouter key saved by `psst --key` |
+| `GLM_API_KEY`, `ZAI_API_KEY`, `ZHIPUAI_API_KEY` | the GLM key, first one set wins; GLM is used automatically if no OpenRouter key is around |
+| `PSST_PROVIDER` | `openrouter` (default) or `glm` |
+| `PSST_MODEL` | model id, default `cohere/north-mini-code:free` with two free fallbacks, or `glm-4.6` → `glm-4.5-air` → `glm-4.5-flash` for GLM |
+| `PSST_OPENROUTER_API`, `PSST_GLM_API` | override the provider's base API URL (e.g. the GLM Coding Plan or bigmodel.cn endpoint) |
 
 The cache lives in `~/.cache/psst/`. It needs no clearing: every entry is tied to the binaries it was computed from.
 

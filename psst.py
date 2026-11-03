@@ -3,18 +3,19 @@
 
     psst find files bigger than 1 MB      # the command lands in your input line, it never runs by itself
     psst                                  # fix the previous command
-    psst --key [KEY]                      # save your OpenRouter key (asked for, hidden, if KEY is left out)
+    psst --key [KEY]                      # save your provider's key (asked for, hidden, if KEY is left out)
     psst --setup [-y] | --uninstall       # add or remove the shell integration (zsh, bash, fish, PowerShell)
     psst --init zsh|bash|fish|pwsh        # print the integration code
     psst --selftest | --eval [1-12,15]    # offline tests | live model on fixtures in a temp dir
-Needs an OpenRouter key (free: https://openrouter.ai/keys), from `psst --key` or OPENROUTER_API_KEY.
+Needs an API key, from `psst --key` or the environment: OpenRouter (free at https://openrouter.ai/keys,
+OPENROUTER_API_KEY) or GLM (https://z.ai; GLM_API_KEY, ZAI_API_KEY or ZHIPUAI_API_KEY).
+PSST_PROVIDER=glm switches to GLM models; PSST_MODEL overrides the model; PSST_GLM_API the GLM endpoint.
 """
-import datetime, functools, hashlib, json, os, platform, re, shlex, shutil, sqlite3, subprocess, sys, tempfile, threading, time
+import datetime, functools, hashlib, io, json, os, platform, re, shlex, shutil, sqlite3, subprocess, sys, tempfile, threading, time
 import urllib.error, urllib.request
 from pathlib import Path
 
-VERSION = "0.1.2"
-API = "https://openrouter.ai/api/v1"
+VERSION = "0.1.3"
 WIN = os.name == "nt"
 SHELLS = {  # name: (run a script, check syntax of stdin, list builtins)
     "zsh": (["-fc"], ["-n", "-f"], "print -l ${(k)builtins} ${(k)reswords}"),
@@ -30,7 +31,23 @@ PS_PARSE = ("[Console]::OutputEncoding = [Text.Encoding]::UTF8; $e = $null; "
             "if ($_ -is [Management.Automation.Language.StringConstantExpressionAst]) { $_.Value -replace '\\s', ' ' } "
             "elseif ($_ -is [Management.Automation.Language.CommandParameterAst]) { '-' + $_.ParameterName } else { '$' } }) -join \"`t\" }")
 BEGIN, END = "# >>> psst >>>", "# <<< psst <<<"
-MODELS = ["cohere/north-mini-code:free", "xingchen-agi/xing4.0-29b-a4b:free", "google/gemma-4-31b-it:free"]
+PROVIDERS = {  # model backends: API base, model chain, key handling
+    "openrouter": {"api": "https://openrouter.ai/api/v1",
+                    "models": ["cohere/north-mini-code:free", "xingchen-agi/xing4.0-29b-a4b:free", "google/gemma-4-31b-it:free"],
+                    "key_env": ("OPENROUTER_API_KEY",), "key_file": "key", "check": "/key", "label": "OpenRouter",
+                    "ask": "OpenRouter key (free at https://openrouter.ai/keys): ",
+                    "nokey": "no OpenRouter key: run `psst --key` (a free key is at https://openrouter.ai/keys)"},
+    "glm": {"api": "https://api.z.ai/api/paas/v4",
+            "models": ["glm-4.6", "glm-4.5-air", "glm-4.5-flash"],
+            "key_env": ("GLM_API_KEY", "ZAI_API_KEY", "ZHIPUAI_API_KEY"), "key_file": "glm_key", "check": "/models", "label": "GLM (z.ai)",
+            "ask": "GLM API key (https://z.ai/manage-apikey/apikey-list): ",
+            "nokey": "no GLM key: run `psst --key` with PSST_PROVIDER=glm, or set GLM_API_KEY or ZAI_API_KEY"},
+}
+API_ENV = {"openrouter": "PSST_OPENROUTER_API", "glm": "PSST_GLM_API"}  # base-URL overrides, e.g. the GLM Coding Plan endpoint
+
+
+class ModelError(RuntimeError):
+    """A per-model failure (unknown model, unsupported parameter): the next model in the chain may still work."""
 KEY_UTILS = "sed grep find awk date stat tar xargs ls cp mv rm du df sort head tail ps readlink base64 split touch cut tac timeout nproc".split()
 PKG = "brew port nix apt dnf yum pacman zypper apk snap flatpak pip pip3 pipx uv conda mamba npm pnpm yarn bun cargo gem go".split()
 KEYWORDS = {"!", "{", "}", "if", "then", "else", "elif", "fi", "do", "done", "while", "until", "time", "esac", "coproc", "and", "or", "not", "begin", "end"}
@@ -557,80 +574,130 @@ def excerpt(path, name, sub):
 
 # ---------- model ----------
 
-def models():
-    m = os.environ.get("PSST_MODEL")
-    return [m] + [x for x in MODELS[1:] if x != m] if m else MODELS
+def provider():
+    """The active backend: PSST_PROVIDER, else inferred from the keys around (OpenRouter by default)."""
+    p = os.environ.get("PSST_PROVIDER", "").strip().lower()
+    if p:
+        if p not in PROVIDERS:
+            raise RuntimeError(f"unknown PSST_PROVIDER {p!r}: use {' or '.join(PROVIDERS)}")
+        return p
+    if not os.environ.get("OPENROUTER_API_KEY", "").strip() and any(os.environ.get(e, "").strip() for e in PROVIDERS["glm"]["key_env"]):
+        return "glm"
+    if os.environ.get("OPENROUTER_API_KEY", "").strip():
+        return "openrouter"
+    return "glm" if key_file("glm").exists() and not key_file("openrouter").exists() else "openrouter"
 
 
-def key_file():
-    return Path(os.environ.get("XDG_CONFIG_HOME") or WIN and os.environ.get("APPDATA") or Path.home() / ".config") / "psst" / "key"
+def api(p=None):
+    """The provider's base API URL; PSST_OPENROUTER_API / PSST_GLM_API override it."""
+    p = p or provider()
+    return (os.environ.get(API_ENV[p], "").strip() or PROVIDERS[p]["api"]).rstrip("/")
 
 
-def api_key():
-    """OPENROUTER_API_KEY, else the key saved by `psst --key`."""
-    key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+def models(p=None):
+    p = p or provider()
+    m = os.environ.get("PSST_MODEL", "").strip()
+    return [m] + [x for x in PROVIDERS[p]["models"][1:] if x != m] if m else list(PROVIDERS[p]["models"])
+
+
+def key_file(p=None):
+    p = p or provider()
+    return Path(os.environ.get("XDG_CONFIG_HOME") or WIN and os.environ.get("APPDATA") or Path.home() / ".config") / "psst" / PROVIDERS[p]["key_file"]
+
+
+def api_key(p=None):
+    """A key from the environment (first name that is set), else the key saved by `psst --key`."""
+    p = p or provider()
+    for e in PROVIDERS[p]["key_env"]:
+        if os.environ.get(e, "").strip():
+            return os.environ[e].strip()
     try:
-        return key or key_file().read_text().strip()
+        return key_file(p).read_text().strip()
     except OSError:
         return ""
 
 
-def set_key(key=""):
-    """psst --key [KEY]: check the key with OpenRouter, then keep it in a file only you can read."""
+def set_key(key="", p=None):
+    """psst --key [KEY]: check the key with its provider, then keep it in a file only you can read."""
     import getpass
+    p = p or provider()
     if not key:
-        key = getpass.getpass("OpenRouter key (free at https://openrouter.ai/keys): ") if sys.stdin.isatty() else sys.stdin.readline()
+        key = getpass.getpass(PROVIDERS[p]["ask"]) if sys.stdin.isatty() else sys.stdin.readline()
     key, data = key.strip(), None
     if not key:
         print("psst: no key given", file=sys.stderr)
         return 1
     try:
-        with urllib.request.urlopen(urllib.request.Request(API + "/key", headers={"Authorization": "Bearer " + key}), timeout=30) as r:
-            data = json.load(r)["data"]
+        with urllib.request.urlopen(urllib.request.Request(api(p) + PROVIDERS[p]["check"], headers={"Authorization": "Bearer " + key}), timeout=30) as r:
+            data = json.load(r)
     except urllib.error.HTTPError as e:
         if e.code in (401, 403):
-            print("psst: OpenRouter does not accept this key", file=sys.stderr)
+            print(f"psst: {PROVIDERS[p]['label']} does not accept this key", file=sys.stderr)
             return 1
     except (urllib.error.URLError, OSError, ValueError, KeyError):
         pass
-    path = key_file()
+    path = key_file(p)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     os.write(fd, key.encode() + b"\n")
     os.close(fd)
     os.chmod(path, 0o600)
-    left = (data or {}).get("free_model_daily_requests", {}).get("remaining")
-    print(f"psst: key saved to {path}" + (f"; {left} free requests left today" if left is not None else
-                                           " (OpenRouter could not be reached to check it)" if data is None else ""), file=sys.stderr)
+    note = "" if data is not None else f" ({PROVIDERS[p]['label']} could not be reached to check it)"
+    if isinstance(data, dict):
+        if p == "openrouter":
+            left = ((data.get("data") or {}).get("free_model_daily_requests") or {}).get("remaining")
+            note = f"; {left} free requests left today" if left is not None else note
+        elif isinstance(data.get("data"), list):
+            note = f"; key accepted, {len(data['data'])} models visible"
+    print(f"psst: key saved to {path}{note}", file=sys.stderr)
     return 0
 
 
-def ask(messages):
-    key = api_key()
-    if not key:
-        raise RuntimeError("no OpenRouter key: run `psst --key` (a free key is at https://openrouter.ai/keys)")
-    time.sleep(max(0.0, STATS["last"] + STATS["gap"] - time.time()))
-    body = {"models": models(), "messages": messages, "temperature": 0, "max_tokens": 4000, "provider": {"data_collection": "deny"}}
-    req = urllib.request.Request(API + "/chat/completions", json.dumps(body).encode(),
-                                 {"Authorization": "Bearer " + key, "Content-Type": "application/json", "X-Title": "psst"})
+def post(p, key, body):
+    """One chat-completions request; returns the reply text. ModelError means the next model may still work."""
+    headers = {"Authorization": "Bearer " + key, "Content-Type": "application/json"} | ({"X-Title": "psst"} if p == "openrouter" else {})
+    req = urllib.request.Request(api(p) + "/chat/completions", json.dumps(body).encode(), headers)
     STATS["requests"] += 1
-    STATS["last"] = time.time()
     try:
         with urllib.request.urlopen(req, timeout=120) as r:
             d = json.load(r)
     except urllib.error.HTTPError as e:
         try:
-            err = json.loads(e.read())["error"]
-            msg = err.get("metadata", {}).get("raw") or err.get("message")
-        except (ValueError, KeyError, TypeError, AttributeError):
+            err = (json.loads(e.read()) or {}).get("error") or {}
+            msg = err.get("metadata", {}).get("raw") or err.get("message") or err.get("code")
+        except (ValueError, AttributeError):
             msg = e.reason
-        raise RuntimeError(f"OpenRouter HTTP {e.code}: {str(msg)[:200]}")
+        raise (ModelError if e.code in (400, 404) else RuntimeError)(f"{PROVIDERS[p]['label']} HTTP {e.code}: {str(msg)[:200]}")
     except (urllib.error.URLError, TimeoutError, OSError) as e:
-        raise RuntimeError(f"OpenRouter: {e}")
+        raise RuntimeError(f"{PROVIDERS[p]['label']}: {e}")
     if "error" in d or not d.get("choices"):
-        raise RuntimeError(f"OpenRouter: {d.get('error', d)}")
+        raise RuntimeError(f"{PROVIDERS[p]['label']}: {d.get('error', d)}")
     STATS["model"] = d.get("model", "")
     return d["choices"][0]["message"].get("content") or ""
+
+
+def ask(messages):
+    p, key = provider(), api_key()
+    if not key:
+        raise RuntimeError(PROVIDERS[p]["nokey"])
+    time.sleep(max(0.0, STATS["last"] + STATS["gap"] - time.time()))
+    STATS["last"] = time.time()
+    if p == "openrouter":  # one request: OpenRouter routes it across the model chain itself
+        return post(p, key, {"models": models(p), "messages": messages, "temperature": 0, "max_tokens": 4000,
+                             "provider": {"data_collection": "deny"}})
+    err = None
+    for m in models(p):  # GLM takes one model per request: walk the chain until a model answers
+        body = {"model": m, "messages": messages, "temperature": 0.01, "max_tokens": 4000, "thinking": {"type": "disabled"}}
+        for _ in range(2):  # forced-thinking models (glm-4.7+) refuse thinking.type=disabled: retry once without it
+            try:
+                return post(p, key, body)
+            except ModelError as e:
+                err = e
+                if "thinking" in str(e).lower() and "thinking" in body:
+                    del body["thinking"]
+                    continue
+                break
+    raise err
 
 
 def parse(text):
@@ -862,9 +929,9 @@ def uninstall():
         path = rc_file(sh)
         if path and path.exists() and edit_rc(path, sh, False):
             print(f"psst: removed the integration from {path}", file=sys.stderr)
-    for extra in (key_file(), db_dir()):
+    for extra in (key_file("openrouter"), key_file("glm"), db_dir()):
         shutil.rmtree(extra, ignore_errors=True) if extra.is_dir() else extra.unlink(missing_ok=True)
-    print(f"psst: removed the integration, the saved key and the cache; the program itself is {SELF[-1]}", file=sys.stderr)
+    print(f"psst: removed the integration, the saved keys and the cache; the program itself is {SELF[-1]}", file=sys.stderr)
     return 0
 
 
@@ -965,6 +1032,8 @@ def selftest():
     os.environ["XDG_CACHE_HOME"] = str(tmp / "cache")
     os.environ["XDG_CONFIG_HOME"] = str(tmp / "config")
     os.environ["OPENROUTER_API_KEY"] = "sk-selftest"  # never sent: answers come from the mock or the cache
+    for e in ("PSST_PROVIDER", "PSST_MODEL", "GLM_API_KEY", "ZAI_API_KEY", "ZHIPUAI_API_KEY", "PSST_GLM_API", "PSST_OPENROUTER_API"):
+        os.environ.pop(e, None)
     os.environ.pop("PSST_SHELL", None)
     global _db, ask
     _db, real_ask, fails, total = None, ask, [], [0]
@@ -1102,16 +1171,95 @@ def selftest():
         out = pty_session(argv, [run_plain, "\r"], plain)
         ok(f"plain {sh}: does not ask again", "add the" not in out and ("QOK_42" in out or not typing), repr(out[-400:]))
 
-    # key: saved privately, read back, the environment variable wins
+    # keys and providers: saved privately per provider, read back, the environment wins, the provider is inferred
     os.environ["OPENROUTER_API_KEY"] = ""
-    global API
-    real_api, API = API, "http://127.0.0.1:9"  # nothing listens there: the key is saved unchecked
+    dead = "http://127.0.0.1:9"  # nothing listens there: keys are saved unchecked
+    real_apis = {q: PROVIDERS[q]["api"] for q in PROVIDERS}
     try:
+        PROVIDERS["openrouter"]["api"] = dead
         ok("key: saved", set_key("sk-test-1") == 0 and api_key() == "sk-test-1" and oct(key_file().stat().st_mode & 0o777) == "0o600")
         os.environ["OPENROUTER_API_KEY"] = "sk-env"
         ok("key: env wins", api_key() == "sk-env")
+        os.environ["OPENROUTER_API_KEY"] = ""
+        key_file("openrouter").unlink()
+        ok("provider: defaults to openrouter", provider() == "openrouter")
+        PROVIDERS["glm"]["api"] = dead
+        os.environ["PSST_PROVIDER"] = "glm"
+        ok("glm: key saved apart", set_key("glm-key-1") == 0 and api_key() == "glm-key-1" and key_file().name == "glm_key" and key_file("openrouter") != key_file())
+        os.environ.pop("PSST_PROVIDER")
+        ok("glm: inferred from the saved key", provider() == "glm")
+        os.environ["GLM_API_KEY"] = "glm-env"
+        ok("glm: env key wins", api_key() == "glm-env")
+        os.environ["ZAI_API_KEY"] = "zai-env"
+        ok("glm: first env name wins", api_key() == "glm-env")
+        os.environ.pop("GLM_API_KEY")
+        ok("glm: ZAI_API_KEY works alone", api_key() == "zai-env")
+        os.environ.pop("ZAI_API_KEY")
+        os.environ["OPENROUTER_API_KEY"] = "sk-env"
+        ok("provider: an OpenRouter env key beats a saved GLM key", provider() == "openrouter")
+        os.environ["OPENROUTER_API_KEY"] = ""
+        os.environ["PSST_PROVIDER"] = "bogus"
+        try:
+            provider()
+            ok("provider: unknown PSST_PROVIDER rejected", False)
+        except RuntimeError:
+            ok("provider: unknown PSST_PROVIDER rejected", True)
+        os.environ.pop("PSST_PROVIDER")
+        ok("glm: model chain", models("glm") == ["glm-4.6", "glm-4.5-air", "glm-4.5-flash"])
+        os.environ["PSST_MODEL"] = "glm-4.5-flash"
+        ok("glm: PSST_MODEL leads the chain", models("glm")[0] == "glm-4.5-flash" and "glm-4.6" not in models("glm"))
+        os.environ.pop("PSST_MODEL")
+
+        # glm ask(): one model per request; rejected models fall through, thinking:disabled is dropped when refused
+        real_urlopen, bodies = urllib.request.urlopen, []
+
+        class Reply:
+            def __init__(self, obj):
+                self.obj = obj
+
+            def read(self):
+                return json.dumps(self.obj).encode()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def glm_400(req, message):
+            return urllib.error.HTTPError(req.full_url, 400, "Bad Request", {}, io.BytesIO(json.dumps({"error": {"message": message}}).encode()))
+
+        def fake_urlopen(req, timeout=None):
+            body = json.loads(req.data)
+            bodies.append((req.full_url, req.headers.get("Authorization"), body))
+            if body.get("model") == "glm-4.6":
+                raise glm_400(req, "model not exists")
+            if "thinking" in body and body.get("model") == "glm-4.5-air":
+                raise glm_400(req, "does not support disabling thinking")
+            return Reply({"model": body.get("model"), "choices": [{"message": {"content": "ok"}}]})
+
+        urllib.request.urlopen = fake_urlopen
+        try:
+            os.environ["PSST_PROVIDER"] = "glm"
+            os.environ["GLM_API_KEY"] = "glm-env"
+            ok("glm ask: model fallback and payload", ask([{"role": "user", "content": "hi"}]) == "ok" and STATS["model"] == "glm-4.5-air"
+               and len(bodies) == 3 and bodies[0][0].endswith("/chat/completions") and bodies[0][1] == "Bearer glm-env"
+               and bodies[2][2]["model"] == "glm-4.5-air" and "thinking" not in bodies[2][2] and bodies[2][2]["temperature"] == 0.01)
+            bodies.clear()
+            urllib.request.urlopen = lambda req, timeout=None: bodies.append(None) or (_ for _ in ()).throw(
+                urllib.error.HTTPError(req.full_url, 401, "Unauthorized", {}, io.BytesIO(b'{"error": {"code": "1001", "message": "bad key"}}')))
+            try:
+                ask([{"role": "user", "content": "hi"}])
+                ok("glm ask: auth errors do not fall through", False)
+            except RuntimeError as e:
+                ok("glm ask: auth errors do not fall through", "HTTP 401" in str(e) and len(bodies) == 1)
+        finally:
+            urllib.request.urlopen = real_urlopen
+            os.environ.pop("GLM_API_KEY", None)
+            os.environ.pop("PSST_PROVIDER", None)
     finally:
-        API = real_api
+        for q, a in real_apis.items():
+            PROVIDERS[q]["api"] = a
         os.environ["OPENROUTER_API_KEY"] = "sk-selftest"
 
     # rc block: added once, replaced not duplicated, removed cleanly; --setup -y and --uninstall end to end
@@ -1310,16 +1458,20 @@ def execute(cmd, t, root, n):
 
 def evaluate(spec):
     picks = sorted({i for part in filter(None, spec.split(",")) for i in (range(int(part.split("-")[0]), int(part.split("-")[-1]) + 1))}) or range(1, len(TASKS) + 1)
-    key = api_key()
+    p = provider()
+    key = api_key(p)
     if not key:
-        print("set OPENROUTER_API_KEY")
+        print(f"set {PROVIDERS[p]['key_env'][0]}")
         return 1
-    with urllib.request.urlopen(urllib.request.Request(API + "/key", headers={"Authorization": "Bearer " + key}), timeout=30) as r:
-        left = json.load(r)["data"].get("free_model_daily_requests", {}).get("remaining")
-    print(f"model: {models()[0]}; free requests left today: {left}")
-    if left is not None and left < 2 * len(picks):
-        print("not enough daily requests left for this run; stopping")
-        return 1
+    if p == "openrouter":
+        with urllib.request.urlopen(urllib.request.Request(api(p) + "/key", headers={"Authorization": "Bearer " + key}), timeout=30) as r:
+            left = json.load(r)["data"].get("free_model_daily_requests", {}).get("remaining")
+        print(f"model: {models(p)[0]}; free requests left today: {left}")
+        if left is not None and left < 2 * len(picks):
+            print("not enough daily requests left for this run; stopping")
+            return 1
+    else:
+        print(f"model: {models(p)[0]}")
     STATS["gap"] = 4.2  # stay under the per-model limit of 15 requests per minute
     root = Path(os.path.realpath(tempfile.mkdtemp(prefix="psst-eval-")))
     if any(TASKS[i - 1]["venv"] for i in picks):
@@ -1356,6 +1508,11 @@ def main(argv):
     if flag == "--version":
         print(VERSION)
         return 0
+    try:
+        provider()  # fail early and clearly on a bad PSST_PROVIDER
+    except RuntimeError as e:
+        print(f"psst: {e}", file=sys.stderr)
+        return 2
     if flag == "--init" and argv[1:2] and argv[1] in INIT:
         print(init(argv[1]), end="")
         return 0
