@@ -15,7 +15,7 @@ import datetime, functools, hashlib, io, json, os, platform, re, shlex, shutil, 
 import urllib.error, urllib.request
 from pathlib import Path
 
-VERSION = "0.1.3"
+VERSION = "0.1.4"
 WIN = os.name == "nt"
 SHELLS = {  # name: (run a script, check syntax of stdin, list builtins)
     "zsh": (["-fc"], ["-n", "-f"], "print -l ${(k)builtins} ${(k)reswords}"),
@@ -86,7 +86,7 @@ EXAMPLES = [  # (task, candidate commands...): the model sees the first candidat
 
 SYSTEM = """You write exactly one shell command for the machine and terminal session described below. The user describes a task in plain words, in any language.
 Reply with one JSON object and nothing else:
-{"command": "<one line for this shell>", "utilities": ["<every program the command runs>"], "explanation": "<one short line, written in the same human language as the task>", "risk": "read|write|delete|network|sudo"}
+{"command": "<one line for this shell>", "utilities": ["<every program the command runs>"], "explanation": "<one short line, always in English>", "risk": "read|write|delete|network|sudo"}
 Rules:
 - The command must work here as is: use only installed commands listed below, or this session's aliases, functions and shell builtins.
 - Every flag must exist in the listed variant of its utility. BSD/macOS tools are not GNU tools: never use GNU-only flags or regex syntax (\\s, \\+, -P) with them. In basic regex (sed, grep without -E) + ? | ( ) are literal: use -E for them.
@@ -94,7 +94,7 @@ Rules:
 - No sudo unless the task needs root. No interactive editors or pagers. Prefer one simple pipeline over scripts.
 - An active virtualenv or conda env already puts its python and pip first on PATH.
 - risk is the most dangerous effect of the command: sudo > delete > write > network > read.
-- The explanation uses the human language of the task text itself, whatever language that is.
+- The explanation is always in English, one short line, whatever language the task itself is in.
 
 Session:
 {session}
